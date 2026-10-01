@@ -150,6 +150,9 @@ fn collect_conf_from_ui(app: &AppWindow) -> (WslConf, WslVersionMeta) {
         gpu_supported: app.get_wsl_config_gpu_supported(),
         time_supported: app.get_wsl_config_time_supported(),
         detection_failed: app.get_wsl_config_version_detection_failed(),
+        // Only the section flags above are consumed by `serialize_wsl_conf`;
+        // capability probes are irrelevant here.
+        ..Default::default()
     };
 
     (conf, meta)

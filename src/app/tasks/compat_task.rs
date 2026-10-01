@@ -5,9 +5,13 @@
 //
 // Starts immediately (0s delay). Polls AppState.bootstrap_data for up to 15 seconds.
 // Once bootstrap_data is ready (unix_time > 0), checks wsl_support configuration.
-// If enabled and since_version is set, compares user's WSL version against the
-// [since_version, until_version] range. If outside range, force-shows the compat dialog
-// (not subject to DND suppression) and records DND timestamp.
+// The server-provided [since_version, until_version] window is merged with the
+// locally verified window (see `crate::wsl::compat`) so that an outdated server
+// list can no longer flag a newer, working WSL as unsupported. The dialog is now
+// only forced when the installed WSL is *older* than the floor, which is the one
+// case that actually risks data corruption. It is not subject to DND
+// suppression, and it records a DND timestamp to suppress later low-priority
+// dialogs.
 
 use tracing::{info, warn};
 use crate::AppWindow;
@@ -54,12 +58,6 @@ impl ScheduledTask for WslCompatTask {
 
         result
     }
-}
-
-// Result of version compatibility check
-struct CompatRange {
-    in_range: bool,
-    range_text: String,
 }
 
 impl WslCompatTask {
@@ -109,111 +107,74 @@ impl WslCompatTask {
         let since = &ws.since_version;
         let until = &ws.until_version;
 
-        info!("wsl_compat: current={}, since='{}', until='{}'", current, since, until);
+        info!(
+            "wsl_compat: current={}, server-since='{}', server-until='{}'",
+            current, since, until
+        );
 
-        let compat = match (since.is_empty(), until.is_empty()) {
-            (false, false) => {
-                // Closed interval [since, until]
-                let in_range = version_gte(current, since) && version_lte(current, until);
-                let range_text = format!("[{}, {}]", since, until);
-                CompatRange { in_range, range_text }
-            }
-            (false, true) => {
-                // Greater-or-equal >= since
-                let in_range = version_gte(current, since);
-                let range_text = format!(">= {}", since);
-                CompatRange { in_range, range_text }
-            }
-            (true, false) => {
-                // Less-or-equal <= until
-                let in_range = version_lte(current, until);
-                let range_text = format!("<= {}", until);
-                CompatRange { in_range, range_text }
-            }
-            (true, true) => {
-                // Both empty, skip
-                info!("wsl_compat: both since_version and until_version are empty, skipping");
-                return Ok(());
-            }
-        };
-
-        if !compat.in_range {
-            warn!("wsl_compat: version {} not in range {}", current, compat.range_text);
-
-            // Highest priority, not subject to DND suppression
-            // Only record DND timestamp to suppress subsequent low-priority dialogs
-            {
-                let mut state = self.app_state.lock().await;
-                state.dialog_dnd.record_dialog_shown();
-            }
-
-            // Build dialog text
-            let msg1 = crate::i18n::tr("dialog.wsl_compat_msg1", &[current.to_string(), compat.range_text]);
-            let msg2 = crate::i18n::t("dialog.wsl_compat_msg2");
-            let msg3 = crate::i18n::tr("dialog.wsl_compat_msg3", &[until.to_string()]);
-            let hint_text = crate::i18n::t("dialog.wsl_compat_issues_hint");
-            let link_text = crate::i18n::t("dialog.wsl_compat_issues_link");
-            let issues_url = if ws.url.is_empty() {
-                format!("{}{}", crate::app::PROJECT_REPOSITORY, crate::app::GITHUB_ISSUES)
-            } else {
-                ws.url.clone()
-            };
-            let show_confirm = ws.confirm != 0;
-
-            info!("wsl_compat: showing compat dialog (show_confirm={})", show_confirm);
-
-            let ah = app_handle.clone();
-            let _ = slint::invoke_from_event_loop(move || {
-                if let Some(app) = ah.upgrade() {
-                    app.set_wsl_compat_msg1(msg1.into());
-                    app.set_wsl_compat_msg2(msg2.into());
-                    app.set_wsl_compat_msg3(msg3.into());
-                    app.set_wsl_compat_hint(hint_text.into());
-                    app.set_wsl_compat_link(link_text.into());
-                    app.set_wsl_compat_issues_url(issues_url.into());
-                    app.set_wsl_compat_show_confirm(show_confirm);
-                    app.set_show_wsl_compat_dialog(true);
-                }
-            });
-        } else {
-            info!("wsl_compat: version {} is within compatible range", current);
+        if crate::wsl::compat::skip_requested() {
+            info!(
+                "wsl_compat: version gate skipped via {}=1",
+                crate::wsl::compat::ENV_SKIP_CHECK
+            );
+            return Ok(());
         }
+
+        // Decide against the *local* verified window merged with the server list.
+        // The server list can only be refreshed server-side and therefore lags
+        // behind the WSL release train (see `crate::wsl::compat`).
+        let (verdict, resolved_min, resolved_max) =
+            crate::wsl::compat::evaluate(current, since, until);
+        let range_text = format!("[{}, {}]", resolved_min, resolved_max);
+
+        if verdict.is_supported() {
+            info!(
+                "wsl_compat: {} accepted, window {} (capabilities probed: {})",
+                current, range_text, version_meta.capabilities_probed
+            );
+            return Ok(());
+        }
+
+        // Only reaches here when the installed WSL is *older* than the floor —
+        // a genuine risk, so the warning is preserved.
+        warn!("wsl_compat: version {} is below the required minimum {}", current, resolved_min);
+
+        // Highest priority, not subject to DND suppression
+        // Only record DND timestamp to suppress subsequent low-priority dialogs
+        {
+            let mut state = self.app_state.lock().await;
+            state.dialog_dnd.record_dialog_shown();
+        }
+
+        // Build dialog text
+        let msg1 = crate::i18n::tr("dialog.wsl_compat_msg1", &[current.to_string(), range_text]);
+        let msg2 = crate::i18n::t("dialog.wsl_compat_msg2");
+        let msg3 = crate::i18n::t("dialog.wsl_compat_msg3");
+        let hint_text = crate::i18n::t("dialog.wsl_compat_issues_hint");
+        let link_text = crate::i18n::t("dialog.wsl_compat_issues_link");
+        let issues_url = if ws.url.is_empty() {
+            format!("{}{}", crate::app::PROJECT_REPOSITORY, crate::app::GITHUB_ISSUES)
+        } else {
+            ws.url.clone()
+        };
+        let show_confirm = ws.confirm != 0;
+
+        info!("wsl_compat: showing compat dialog (show_confirm={})", show_confirm);
+
+        let ah = app_handle.clone();
+        let _ = slint::invoke_from_event_loop(move || {
+            if let Some(app) = ah.upgrade() {
+                app.set_wsl_compat_msg1(msg1.into());
+                app.set_wsl_compat_msg2(msg2.into());
+                app.set_wsl_compat_msg3(msg3.into());
+                app.set_wsl_compat_hint(hint_text.into());
+                app.set_wsl_compat_link(link_text.into());
+                app.set_wsl_compat_issues_url(issues_url.into());
+                app.set_wsl_compat_show_confirm(show_confirm);
+                app.set_show_wsl_compat_dialog(true);
+            }
+        });
 
         Ok(())
     }
-}
-
-// Parse version string into Vec<u64>, supports 2-4 segments
-fn parse_version(s: &str) -> Vec<u64> {
-    s.split('.')
-        .filter_map(|p| p.parse().ok())
-        .collect()
-}
-
-// Check if a >= b
-fn version_gte(a: &str, b: &str) -> bool {
-    let a_parts = parse_version(a);
-    let b_parts = parse_version(b);
-    let len = a_parts.len().max(b_parts.len());
-    for i in 0..len {
-        let av = a_parts.get(i).copied().unwrap_or(0);
-        let bv = b_parts.get(i).copied().unwrap_or(0);
-        if av > bv { return true; }
-        if av < bv { return false; }
-    }
-    true // Equal
-}
-
-// Check if a <= b
-fn version_lte(a: &str, b: &str) -> bool {
-    let a_parts = parse_version(a);
-    let b_parts = parse_version(b);
-    let len = a_parts.len().max(b_parts.len());
-    for i in 0..len {
-        let av = a_parts.get(i).copied().unwrap_or(0);
-        let bv = b_parts.get(i).copied().unwrap_or(0);
-        if av < bv { return true; }
-        if av > bv { return false; }
-    }
-    true // Equal
 }

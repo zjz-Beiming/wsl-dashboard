@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 
 use ini::Ini;
-use tracing::{info, warn, error, trace};
+use tracing::{info, warn, error, trace, debug};
 use std::sync::Mutex;
 use once_cell::sync::Lazy;
 use crate::wsl::executor::WslCommandExecutor;
@@ -124,7 +124,12 @@ impl Default for TimeSection {
     }
 }
 
-// Version metadata returned to the frontend for UI display
+// Version metadata returned to the frontend for UI display.
+//
+// The `*_supported` flags used to be derived from the WSL version number, which
+// breaks every time Microsoft ships a new release line. They are now filled in
+// by a *runtime capability probe* that inspects `wsl --help`, so a newer WSL is
+// described correctly without having to ship a new build of this app.
 #[derive(Debug, Clone)]
 pub struct WslVersionMeta {
     pub version_string: String,
@@ -132,6 +137,22 @@ pub struct WslVersionMeta {
     pub gpu_supported: bool,
     pub time_supported: bool,
     pub detection_failed: bool,
+
+    /// `wsl --manage <distro> --compact` (native VHDX compaction, no Hyper-V
+    /// module and no elevation required).
+    pub manage_compact_supported: bool,
+    /// `wsl --manage <distro> --resize <size>`.
+    pub manage_resize_supported: bool,
+    /// `wsl --manage <distro> --set-default-user <user>`.
+    pub manage_set_default_user_supported: bool,
+    /// `wsl --export <distro> <file> --format <tar|tar.gz|tar.xz|vhd>`.
+    pub export_format_supported: bool,
+    /// `wsl --install ... --fixed-vhd` and `--vhd-size`.
+    pub install_fixed_vhd_supported: bool,
+    /// `true` when at least one capability probe succeeded. `false` means the
+    /// probe output could not be read and callers must fall back to the
+    /// conservative legacy path.
+    pub capabilities_probed: bool,
 }
 
 impl Default for WslVersionMeta {
@@ -142,6 +163,14 @@ impl Default for WslVersionMeta {
             gpu_supported: true,
             time_supported: true,
             detection_failed: false,
+            // Conservative defaults: never claim a new capability unless it was
+            // actually observed in `wsl --help`.
+            manage_compact_supported: false,
+            manage_resize_supported: false,
+            manage_set_default_user_supported: false,
+            export_format_supported: false,
+            install_fixed_vhd_supported: false,
+            capabilities_probed: false,
         }
     }
 }
@@ -387,11 +416,11 @@ pub async fn check_wsl_version_support(executor: &WslCommandExecutor) -> WslVers
     if !result.success {
         warn!("Failed to run 'wsl --version'");
         return WslVersionMeta {
-            version_string: String::new(),
             boot_supported: false,
             gpu_supported: false,
             time_supported: false,
             detection_failed: true,
+            ..Default::default()
         };
     }
 
@@ -430,6 +459,7 @@ pub async fn check_wsl_version_support(executor: &WslCommandExecutor) -> WslVers
             gpu_supported: false,
             time_supported: false,
             detection_failed: true,
+            ..Default::default()
         };
     }
 
@@ -470,17 +500,106 @@ pub async fn check_wsl_version_support(executor: &WslCommandExecutor) -> WslVers
     let gpu_supported = major >= 1;
     let time_supported = gpu_supported;
 
+    // Capabilities are observed, not guessed from the version number.
+    let caps = probe_wsl_capabilities(executor).await;
+
     let meta = WslVersionMeta {
         version_string,
         boot_supported,
         gpu_supported,
         time_supported,
         detection_failed: false,
+        manage_compact_supported: caps.manage_compact_supported,
+        manage_resize_supported: caps.manage_resize_supported,
+        manage_set_default_user_supported: caps.manage_set_default_user_supported,
+        export_format_supported: caps.export_format_supported,
+        install_fixed_vhd_supported: caps.install_fixed_vhd_supported,
+        capabilities_probed: caps.capabilities_probed,
     };
+
+    info!(
+        "WSL {} capabilities: compact={}, resize={}, set-default-user={}, export-format={}, fixed-vhd={}, probed={}",
+        meta.version_string,
+        meta.manage_compact_supported,
+        meta.manage_resize_supported,
+        meta.manage_set_default_user_supported,
+        meta.export_format_supported,
+        meta.install_fixed_vhd_supported,
+        meta.capabilities_probed
+    );
 
     let mut cache = VERSION_CACHE.lock().unwrap();
     *cache = Some(meta.clone());
     meta
+}
+
+// Capability flags discovered by reading `wsl --help`.
+pub struct WslCapabilities {
+    pub manage_compact_supported: bool,
+    pub manage_resize_supported: bool,
+    pub manage_set_default_user_supported: bool,
+    pub export_format_supported: bool,
+    pub install_fixed_vhd_supported: bool,
+    pub capabilities_probed: bool,
+}
+
+impl Default for WslCapabilities {
+    fn default() -> Self {
+        Self {
+            manage_compact_supported: false,
+            manage_resize_supported: false,
+            manage_set_default_user_supported: false,
+            export_format_supported: false,
+            install_fixed_vhd_supported: false,
+            capabilities_probed: false,
+        }
+    }
+}
+
+/// Discover which optional `wsl.exe` switches exist on this machine.
+///
+/// Probing the help text is deliberately preferred over comparing version
+/// numbers: WSL ships new switches in patch releases, and older 2.x builds
+/// already carry some of them. Only ASCII switch names are matched, so the
+/// result is identical on every UI language (the help text itself is localized
+/// by Microsoft, the switches are not).
+pub async fn probe_wsl_capabilities(executor: &WslCommandExecutor) -> WslCapabilities {
+    let result = executor.execute_command(&["--help"]).await;
+
+    // Even a non-zero exit status still yields the help text, so join both
+    // streams instead of requiring `success`.
+    let help = format!(
+        "{}\n{}",
+        result.output,
+        result.error.clone().unwrap_or_default()
+    );
+
+    if help.trim().is_empty() {
+        warn!("Capability probe failed: 'wsl --help' produced no output");
+        return WslCapabilities::default();
+    }
+
+    let has = |flag: &str| help.contains(flag);
+
+    let caps = WslCapabilities {
+        manage_compact_supported: has("--compact"),
+        manage_resize_supported: has("--resize"),
+        manage_set_default_user_supported: has("--set-default-user"),
+        export_format_supported: has("--format"),
+        install_fixed_vhd_supported: has("--fixed-vhd"),
+        capabilities_probed: true,
+    };
+
+    debug!(
+        "WSL capability probe: compact={}, resize={}, set-default-user={}, export-format={}, fixed-vhd={}",
+        caps.manage_compact_supported,
+        caps.manage_resize_supported,
+        caps.manage_set_default_user_supported,
+        caps.export_format_supported,
+        caps.install_fixed_vhd_supported
+    );
+
+    caps
 }
 
 // Save wsl.conf to a distribution

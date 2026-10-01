@@ -197,9 +197,35 @@ pub async fn optimize_vhd_elevated(vhdx_path: &str) -> WslCommandResult<String> 
     }
 }
 
+// Compact VHDX using the native WSL command: `wsl --manage <distro> --compact`.
+//
+// Preferred over Optimize-VHD whenever the installed WSL offers it:
+//   * no Hyper-V PowerShell module required,
+//   * no UAC elevation prompt (Optimize-VHD has to Start-Process -Verb RunAs),
+//   * it is the code path Microsoft actually maintains and tests.
+// The distro must be stopped; the caller guarantees that before calling.
+pub async fn compact_vhd_native(executor: &WslCommandExecutor, distro_name: &str) -> WslCommandResult<String> {
+    info!("Compacting VHDX via native 'wsl --manage \"{}\" --compact'", distro_name);
+
+    let result = executor.execute_command(&["--manage", distro_name, "--compact"]).await;
+
+    if result.success {
+        info!("Native 'wsl --manage --compact' completed for '{}'", distro_name);
+        WslCommandResult::success("wsl --manage --compact completed".to_string(), None)
+    } else {
+        let err = result
+            .error
+            .clone()
+            .filter(|e| !e.trim().is_empty())
+            .unwrap_or_else(|| result.output.clone());
+        warn!("Native 'wsl --manage --compact' failed for '{}': {}", distro_name, err);
+        WslCommandResult::error(result.output, err)
+    }
+}
+
 // Core compression workflow:
 // 1. Force Export to .tar file: serves as both "safety backup" and "compression source".
-// 2. Try Optimize-VHD: the fastest path.
+// 2. Try the native compactor, or Optimize-VHD as a fallback: the fastest path.
 // 3. If that fails, re-Import from the existing .tar: the most robust path.
 pub async fn compress_vhdx<F>(
     executor: &WslCommandExecutor, 
@@ -329,15 +355,28 @@ where F: Fn(&str) {
 
     // ========== 6. Compression strategy ==========
     
-    // --- Tier 1: Try Optimize-VHD (fast shrink) ---
+    // --- Tier 1: compact the VHDX in place (fast shrink) ---
     // Only applies to WSL 2 (VHDX path exists)
     let mut opt_result = WslCommandResult::error(String::new(), "Not a VHDX-based distro".to_string());
     let mut saved_opt = 0;
 
     if !vhdx_path.is_empty() {
         progress_callback("task.compress_diskpart");
-        info!("=== Trying Tier 1: Optimize-VHD ===");
-        opt_result = optimize_vhd_elevated(&vhdx_path).await;
+
+        // Probe instead of guessing from the version number: pick the native
+        // compactor when the installed WSL offers it, otherwise fall back to the
+        // legacy Optimize-VHD path (which needs Hyper-V + elevation).
+        let use_native = crate::wsl::ops::config::check_wsl_version_support(executor)
+            .await
+            .manage_compact_supported;
+
+        if use_native {
+            info!("=== Trying Tier 1: native 'wsl --manage --compact' ===");
+            opt_result = compact_vhd_native(executor, distro_name).await;
+        } else {
+            info!("=== Trying Tier 1: Optimize-VHD (native --compact not offered by this WSL) ===");
+            opt_result = optimize_vhd_elevated(&vhdx_path).await;
+        }
 
         let size_after_opt = fs::metadata(&vhdx_path).map(|m| m.len()).unwrap_or(0);
         saved_opt = if size_before > size_after_opt { size_before - size_after_opt } else { 0 };
@@ -346,7 +385,7 @@ where F: Fn(&str) {
         // If Tier 1 succeeded and freed more than 100MB, consider the result satisfactory and finish.
         if opt_result.success && saved_opt > 100 * 1024 * 1024 {
             let saved_gb = saved_opt as f64 / (1024.0 * 1024.0 * 1024.0);
-            info!("Compression finished via Optimize-VHD (Tier 1). Saved: {:.2} GB", saved_gb);
+            info!("Compression finished via Tier 1. Saved: {:.2} GB", saved_gb);
             
             if !backup_first {
                 info!("User did not request to keep backup, removing tar file.");

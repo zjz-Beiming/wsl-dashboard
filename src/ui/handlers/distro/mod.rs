@@ -43,7 +43,10 @@ pub fn sanitize_instance_name(name: &str) -> String {
     }
     
     if sanitized.len() > 25 {
-        sanitized.truncate(25);
+        // `String::truncate` panics when the byte index is not a char boundary,
+        // so back off to a safe cut before calling it.
+        let cut = crate::utils::truncate_bytes(&sanitized, 25).len();
+        sanitized.truncate(cut);
         while sanitized.ends_with('-') || sanitized.ends_with('.') {
             sanitized.pop();
         }

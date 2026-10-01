@@ -112,7 +112,7 @@ pub async fn install_from_mirror(
                 }
                 DownloadProgressOwned::MirrorFailed { mirror, error } => {
                     let short_error = if error.len() > 60 {
-                        format!("{}...", &error[..60])
+                        crate::utils::truncate_bytes_ellipsis(&error, 60)
                     } else {
                         error.clone()
                     };
@@ -180,7 +180,7 @@ pub async fn install_from_mirror(
             let downloaded_file_str = downloaded_file.to_string_lossy().to_string();
             let import_args = vec!["--import", &final_name, &target_path, &downloaded_file_str];
             let display_file = if downloaded_file_str.len() > 30 {
-                format!("{}...", &downloaded_file_str[..30])
+                crate::utils::truncate_bytes_ellipsis(&downloaded_file_str, 30)
             } else {
                 downloaded_file_str.clone()
             };

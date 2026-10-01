@@ -573,6 +573,7 @@ mod tests {
             mail: true,
             hide_pin: false,
             show_drag: true,
+            mount_auto_probe: false,
         };
 
         // Verify TOML round-trip with serde

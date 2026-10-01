@@ -180,9 +180,17 @@ impl WslCommandExecutor {
                 let stdout = decode_output(&stdout_bytes);
                 let stderr = decode_output(&stderr_bytes);
 
+                // Truncate for logging. `max_len` is a BYTE budget, so the cut
+                // point has to be moved back to a UTF-8 char boundary: WSL output
+                // is localized, and slicing mid-character panics the worker
+                // thread (`end byte index 1000 is not a char boundary`).
                 fn truncate_log(s: &str, max_len: usize) -> String {
                     if s.len() > max_len {
-                        format!("{}... (truncated, total {} chars)", &s[..max_len], s.len())
+                        format!(
+                            "{}... (truncated, total {} bytes)",
+                            crate::utils::truncate_bytes(s, max_len),
+                            s.len()
+                        )
                     } else {
                         s.to_string()
                     }

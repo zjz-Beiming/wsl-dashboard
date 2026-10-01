@@ -14,7 +14,7 @@ fn short_filename(command: &str) -> String {
     let trimmed = command.trim();
     let name = trimmed.rsplit(['\\', '/']).next().unwrap_or(trimmed);
     if name.len() > 32 {
-        format!("{}...", &name[..29])
+        crate::utils::truncate_bytes_ellipsis(name, 29)
     } else {
         name.to_string()
     }
